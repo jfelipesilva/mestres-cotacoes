@@ -5,6 +5,7 @@ use App\Http\Controllers\Web\CorretorController;
 use App\Http\Controllers\Web\DashboardController;
 use App\Http\Controllers\Web\SeguradoraController;
 use App\Http\Controllers\Web\SolicitacaoController;
+use App\Http\Controllers\Web\UserController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', function () {
@@ -16,6 +17,7 @@ Route::middleware(['auth', 'verified'])->group(function () {
 
     Route::resource('seguradoras', SeguradoraController::class);
     Route::resource('corretores', CorretorController::class);
+    Route::resource('users', UserController::class)->except(['show']);
 
     Route::get('/solicitacoes', [SolicitacaoController::class, 'index'])->name('solicitacoes.index');
     Route::get('/solicitacoes/{solicitacao}', [SolicitacaoController::class, 'show'])->name('solicitacoes.show');
