@@ -11,6 +11,19 @@ use Illuminate\Support\Facades\Storage;
 
 class SubSolicitacaoController extends Controller
 {
+    public function pending(): JsonResponse
+    {
+        $sub = CotacaoSubSolicitacao::where('status', StatusSubSolicitacao::Pending)
+            ->oldest()
+            ->first();
+
+        if (!$sub) {
+            return response()->json(['data' => null, 'message' => 'Nenhuma sub-solicitação pendente']);
+        }
+
+        return $this->show($sub);
+    }
+
     public function show(CotacaoSubSolicitacao $subSolicitacao): JsonResponse
     {
         $subSolicitacao->load(['solicitacao.corretor', 'seguradora']);
