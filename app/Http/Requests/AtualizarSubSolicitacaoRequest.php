@@ -20,6 +20,8 @@ class AtualizarSubSolicitacaoRequest extends FormRequest
             'agent_log' => 'nullable|string',
             'error_message' => 'nullable|string',
             'result_data' => 'nullable|array',
+            'proposal_url' => 'nullable|string|max:500',
+            'broker_notified_at' => 'nullable|date',
             'pdf' => 'nullable|file|mimes:pdf|max:10240',
         ];
     }

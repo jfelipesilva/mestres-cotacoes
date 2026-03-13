@@ -43,6 +43,7 @@ class SubSolicitacaoController extends Controller
                     'raw_message' => $subSolicitacao->solicitacao->raw_message,
                     'vehicle_data' => $subSolicitacao->solicitacao->vehicle_data,
                     'client_data' => $subSolicitacao->solicitacao->client_data,
+                    'corretor_phone' => $subSolicitacao->solicitacao->corretor->phone ?? null,
                 ],
                 'seguradora' => [
                     'id' => $subSolicitacao->seguradora->id,

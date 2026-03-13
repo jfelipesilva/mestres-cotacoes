@@ -21,9 +21,11 @@ class CotacaoSubSolicitacao extends Model
         'agent_log',
         'error_message',
         'pdf_path',
+        'proposal_url',
         'result_data',
         'started_at',
         'completed_at',
+        'broker_notified_at',
         'attempts',
     ];
 
@@ -32,6 +34,7 @@ class CotacaoSubSolicitacao extends Model
         'result_data' => 'array',
         'started_at' => 'datetime',
         'completed_at' => 'datetime',
+        'broker_notified_at' => 'datetime',
         'attempts' => 'integer',
     ];
 
