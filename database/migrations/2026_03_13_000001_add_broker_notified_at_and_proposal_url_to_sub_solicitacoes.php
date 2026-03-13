@@ -9,8 +9,12 @@ return new class extends Migration
     public function up(): void
     {
         Schema::table('cotacao_sub_solicitacoes', function (Blueprint $table) {
-            $table->timestamp('broker_notified_at')->nullable()->after('completed_at');
-            $table->string('proposal_url', 500)->nullable()->after('pdf_path');
+            if (!Schema::hasColumn('cotacao_sub_solicitacoes', 'broker_notified_at')) {
+                $table->timestamp('broker_notified_at')->nullable()->after('completed_at');
+            }
+            if (!Schema::hasColumn('cotacao_sub_solicitacoes', 'proposal_url')) {
+                $table->string('proposal_url', 500)->nullable()->after('pdf_path');
+            }
         });
     }
 
