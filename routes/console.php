@@ -20,3 +20,16 @@ Artisan::command('inspire', function () {
 Schedule::command('cotacoes:disparar-cotador')
     ->everyMinute()
     ->withoutOverlapping();
+
+/*
+|--------------------------------------------------------------------------
+| Disparo da notificação ao corretor (OpenClaw) sob demanda
+|--------------------------------------------------------------------------
+| A cada minuto faz APENAS uma query SQL: se houver cotação finalizada não
+| comunicada ao corretor (fora da carência de 5 min), aciona o orquestrador
+| para enviar a devolutiva. Substitui o cron interno notificacao-pendente-check.
+| Ver: docs/integracao-cotador-openclaw.md
+*/
+Schedule::command('cotacoes:disparar-notificacao')
+    ->everyMinute()
+    ->withoutOverlapping();

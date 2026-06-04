@@ -1,0 +1,14 @@
+# Regras sudoers para os disparos do OpenClaw acionados pelo scheduler do Laravel.
+#
+# Instalar no servidor como /etc/sudoers.d/cotacoes-openclaw (root:root, 0440):
+#   sudo install -m 0440 -o root -g root deploy/sudoers-cotacoes /etc/sudoers.d/cotacoes-openclaw
+#   sudo visudo -cf /etc/sudoers.d/cotacoes-openclaw   # valida a sintaxe
+#   sudo rm -f /etc/sudoers.d/cotador-cotacoes         # remove a regra antiga (só cotador), se existir
+#
+# Permite ao usuário "deploy" executar APENAS os wrappers fixos, como root, sem
+# senha. Sem wildcard: o deploy não controla nenhum argumento — menor privilégio.
+#
+# Ver: docs/integracao-cotador-openclaw.md
+
+deploy ALL=(root) NOPASSWD: /usr/local/bin/disparar-cotador
+deploy ALL=(root) NOPASSWD: /usr/local/bin/disparar-notificacao

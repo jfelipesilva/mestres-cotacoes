@@ -22,4 +22,17 @@ return [
         'dispatch_enabled' => env('OPENCLAW_COTADOR_DISPATCH_ENABLED', true),
         'trigger_command' => env('OPENCLAW_COTADOR_TRIGGER_COMMAND', 'sudo /usr/local/bin/disparar-cotador'),
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Disparo da notificação ao corretor (push, sob demanda)
+    |--------------------------------------------------------------------------
+    | O scheduler (cotacoes:disparar-notificacao) aciona o agente orquestrador
+    | para enviar a devolutiva ao corretor apenas quando há cotação finalizada
+    | ainda não comunicada. Wrapper instalado no servidor (sudoers NOPASSWD).
+    */
+    'notificacao' => [
+        'dispatch_enabled' => env('OPENCLAW_NOTIFICACAO_DISPATCH_ENABLED', true),
+        'trigger_command' => env('OPENCLAW_NOTIFICACAO_TRIGGER_COMMAND', 'sudo /usr/local/bin/disparar-notificacao'),
+    ],
 ];

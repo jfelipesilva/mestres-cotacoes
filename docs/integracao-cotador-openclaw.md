@@ -1,9 +1,9 @@
-# Integração: disparo do cotador (OpenClaw) sob demanda
+# Integração: disparo dos agentes do OpenClaw sob demanda
 
-> **TL;DR** — Trocamos o *polling* caro (o OpenClaw chamava o LLM a cada 3 min mesmo sem
-> trabalho) por *push*: o Laravel vigia o banco (query SQL, custo zero) e só aciona o
-> agente cotador quando há cotação pendente. Resultado: de ~480 invocações de IA/dia → 0
-> em vazio.
+> **TL;DR** — Trocamos o *polling* caro (o OpenClaw chamava o LLM a cada poucos minutos
+> mesmo sem trabalho) por *push*: o Laravel vigia o banco (query SQL, custo zero) e só
+> aciona os agentes quando há trabalho real. Dois disparos foram migrados:
+> **cotador** (executa cotações) e **notificação** (devolutiva ao corretor).
 
 ---
 
@@ -16,61 +16,63 @@ O sistema Mestres Cotações tem duas camadas:
 | **Laravel** (este repo) | API + banco `assistente_cotacoes` | Guarda solicitações, sub-solicitações, corretores, seguradoras e os `prompt_instructions` |
 | **OpenClaw** (`mestresdoseguro-assistant`) | Agentes de IA (`orquestrador`, `cotador`) | Conversa no WhatsApp e executa cotações via browser |
 
-Originalmente, o processamento das cotações era acionado por um **cron interno do OpenClaw**
-(`cotador-check`, a cada 3 minutos). Esse cron invocava o agente `cotador` — e, portanto, o
-LLM (`claude-sonnet-4-6`) — a cada ciclo, **mesmo quando não havia nada a cotar**. Isso gerava
-~480 execuções/dia em vazio e foi a causa de um esgotamento de créditos da API Anthropic.
+Originalmente, o processamento era acionado por **crons internos do OpenClaw**, que invocavam
+os agentes — e, portanto, o LLM (`claude-sonnet-4-6`) — a cada ciclo, **mesmo sem trabalho**:
 
-A solução é inverter o controle: **o Laravel decide quando há trabalho** (uma simples query no
-banco, sem custo) e só então dispara o agente. O LLM só roda quando há cotação real.
+| Cron antigo (OpenClaw) | Frequência | Execuções/dia em vazio |
+|------------------------|------------|------------------------|
+| `cotador-check` | 3 min | ~480 |
+| `notificacao-pendente-check` | 5 min | ~288 |
+
+Isso esgotou os créditos da API Anthropic. A solução inverte o controle: **o Laravel decide
+quando há trabalho** (query SQL, custo zero) e só então dispara o agente. O LLM só roda
+quando há, de fato, algo a fazer.
 
 ```
 ┌─────────────────────────┐         ┌──────────────────────────┐
 │  LARAVEL (scheduler)     │         │  OPENCLAW (mestremario)  │
 │  a cada 1 min            │         │                          │
 │  → SÓ query SQL (grátis) │         │                          │
-│                          │         │                          │
-│  Há sub pendente E       │ ──────▶ │  Agente cotador          │
-│  nenhuma "running"?      │ gatilho │  (LLM + browser)         │
-│         │                │         │  SÓ quando há trabalho   │
-│         └─ não → nada    │         │                          │
+│                          │ ──────▶ │  cotador  (cotação)      │
+│  Há trabalho?            │ gatilho │  orquestrador (devolutiva)│
+│   └─ não → nada          │         │  SÓ quando há trabalho   │
 └─────────────────────────┘         └──────────────────────────┘
 ```
 
 ---
 
-## 2. Como funciona o disparo
+## 2. Os dois disparos
 
-1. O scheduler do Laravel roda `cotacoes:disparar-cotador` **a cada minuto**.
-2. O command verifica:
-   - Existe alguma `CotacaoSubSolicitacao` com status `pending`? Se não, encerra (silencioso).
-   - Existe alguma com status `running`? Se sim, encerra (já há um cotador trabalhando — **lock natural via banco**).
-   - Consegue adquirir o lock de cache `cotador:dispatching` (TTL 180s)? Esse lock cobre a
-     janela entre disparar o agente e ele marcar a sub como `running`, evitando disparo duplo.
-3. Se passou pelas três checagens, executa o comando configurado em
-   `config('openclaw.cotador.trigger_command')` — por padrão `sudo /usr/local/bin/disparar-cotador`.
-4. O wrapper dispara o `docker exec ... openclaw agent --agent cotador` **em background**
-   (fire-and-forget) e retorna na hora, sem bloquear o scheduler.
+### 2.1. Cotador — `cotacoes:disparar-cotador`
 
-> O agente `cotador` processa a sub-solicitação **mais antiga** por execução. Havendo várias
-> pendentes, o scheduler redispara nos minutos seguintes (após o `running` da anterior ser
-> liberado), processando a fila sequencialmente.
+1. Existe `CotacaoSubSolicitacao` com status `pending`? Se não, encerra (silencioso).
+2. Existe alguma `running`? Se sim, encerra (já há um cotador trabalhando — **lock natural via banco**).
+3. Adquire o lock de cache `cotador:dispatching` (180s) e dispara o agente `cotador`, que
+   processa a sub-solicitação mais antiga (login na seguradora + cotação via browser).
+
+### 2.2. Notificação — `cotacoes:disparar-notificacao`
+
+1. Existe sub-solicitação `completed`/`failed`, com `broker_notified_at IS NULL` e
+   `completed_at` há **mais de 5 min**? Se não, encerra (silencioso).
+2. Adquire o lock `notificacao:dispatching` (180s) e dispara o agente `orquestrador` com a
+   mensagem *"Verificar sub-solicitações não notificadas"*. Ele envia a devolutiva ao
+   corretor via WhatsApp (resultado se `completed`; erro traduzido se `failed`) e marca
+   `broker_notified_at` em cada sub notificada.
+
+> **Carência de 5 min:** dá tempo para a notificação *reativa* (quando o corretor manda
+> mensagem) acontecer primeiro e permite agrupar várias seguradoras numa só devolutiva.
+
+Em ambos, o disparo é **fire-and-forget**: o wrapper roda o `docker exec` em background e
+retorna na hora, sem bloquear o scheduler. O lock de cache garante disparo único enquanto o
+agente reflete o trabalho no banco (`running` / `broker_notified_at`).
 
 ### Transporte escolhido
 
-O disparo usa **`docker exec` no container do OpenClaw**, autorizado ao usuário `deploy` por
-uma regra **sudoers NOPASSWD restrita a um wrapper fixo** (sem wildcard). Alternativas avaliadas
-e descartadas:
-
-- *Adicionar `deploy` ao grupo docker*: simples, mas equivale a root no host.
-- *Cliente WebSocket em PHP falando direto com o gateway*: sem mexer em permissão, mas exige
-  reimplementar um protocolo não-documentado (`sessions.create`/`sessions.send`/`agent.wait`)
-  que quebra a cada update do OpenClaw.
-- *CLI `openclaw` no host via WebSocket*: robusto e sem permissão docker, mas instala o pacote
-  completo (pesado, com browser/Playwright) só para disparar um RPC.
-
-O wrapper + sudoers dá o **menor privilégio** com o **mínimo de código**: o `deploy` só consegue
-"apertar o botão", nada além.
+`docker exec` no container do OpenClaw, autorizado ao usuário `deploy` por uma regra
+**sudoers NOPASSWD restrita a wrappers fixos** (sem wildcard) — menor privilégio com o mínimo
+de código. Alternativas (grupo docker; cliente WebSocket em PHP; CLI `openclaw` no host) foram
+descartadas por dar root no host, exigir reimplementar protocolo não-documentado, ou instalar
+o pacote completo do OpenClaw só para um RPC.
 
 ---
 
@@ -78,20 +80,24 @@ O wrapper + sudoers dá o **menor privilégio** com o **mínimo de código**: o 
 
 | Arquivo | Papel |
 |---------|-------|
-| `app/Console/Commands/DispararCotadorPendente.php` | Command `cotacoes:disparar-cotador` — a lógica de decisão e disparo |
-| `routes/console.php` | Agenda o command (`everyMinute`, `withoutOverlapping`) |
-| `config/openclaw.php` | Bloco `cotador` (`dispatch_enabled`, `trigger_command`) |
-| `.env.example` | Variáveis `OPENCLAW_COTADOR_*` |
-| `deploy/disparar-cotador.sh` | Wrapper a ser instalado no servidor como `/usr/local/bin/disparar-cotador` |
-| `deploy/sudoers-cotador` | Regra a ser instalada como `/etc/sudoers.d/cotador-cotacoes` |
+| `app/Console/Commands/Concerns/DisparaAgenteOpenClaw.php` | Trait com a lógica comum (lock + Process + log) |
+| `app/Console/Commands/DispararCotadorPendente.php` | Command `cotacoes:disparar-cotador` |
+| `app/Console/Commands/DispararNotificacaoPendente.php` | Command `cotacoes:disparar-notificacao` |
+| `routes/console.php` | Agenda os dois commands (`everyMinute`, `withoutOverlapping`) |
+| `config/openclaw.php` | Blocos `cotador` e `notificacao` (`dispatch_enabled`, `trigger_command`) |
+| `.env.example` | Variáveis `OPENCLAW_COTADOR_*` e `OPENCLAW_NOTIFICACAO_*` |
+| `deploy/disparar-cotador.sh` | Wrapper → `/usr/local/bin/disparar-cotador` |
+| `deploy/disparar-notificacao.sh` | Wrapper → `/usr/local/bin/disparar-notificacao` |
+| `deploy/sudoers-cotacoes` | Regras → `/etc/sudoers.d/cotacoes-openclaw` |
 
 ### Variáveis de ambiente
 
 ```dotenv
-# Liga/desliga o disparo (útil para pausar sem mexer no cron)
+# Liga/desliga cada disparo (pausar sem mexer no cron)
 OPENCLAW_COTADOR_DISPATCH_ENABLED=true
-# Comando que dispara o agente (wrapper com sudoers no servidor)
 OPENCLAW_COTADOR_TRIGGER_COMMAND="sudo /usr/local/bin/disparar-cotador"
+OPENCLAW_NOTIFICACAO_DISPATCH_ENABLED=true
+OPENCLAW_NOTIFICACAO_TRIGGER_COMMAND="sudo /usr/local/bin/disparar-notificacao"
 ```
 
 ---
@@ -101,80 +107,73 @@ OPENCLAW_COTADOR_TRIGGER_COMMAND="sudo /usr/local/bin/disparar-cotador"
 > Servidor: `ssh mestremario` · Projeto: `/var/www/mestres-cotacoes` (usuário `deploy`) ·
 > Container OpenClaw: `mestresdoseguro-assistant`.
 
-### 4.1. Instalar o wrapper (como root)
+### 4.1. Instalar os wrappers (como root)
 
 ```bash
 sudo install -m 0755 -o root -g root \
-  /var/www/mestres-cotacoes/deploy/disparar-cotador.sh \
-  /usr/local/bin/disparar-cotador
+  /var/www/mestres-cotacoes/deploy/disparar-cotador.sh /usr/local/bin/disparar-cotador
+sudo install -m 0755 -o root -g root \
+  /var/www/mestres-cotacoes/deploy/disparar-notificacao.sh /usr/local/bin/disparar-notificacao
 ```
 
 ### 4.2. Instalar a regra sudoers (como root)
 
 ```bash
 sudo install -m 0440 -o root -g root \
-  /var/www/mestres-cotacoes/deploy/sudoers-cotador \
-  /etc/sudoers.d/cotador-cotacoes
-
-# Validar a sintaxe (NÃO pular — sudoers quebrado trava o sudo):
-sudo visudo -cf /etc/sudoers.d/cotador-cotacoes
+  /var/www/mestres-cotacoes/deploy/sudoers-cotacoes /etc/sudoers.d/cotacoes-openclaw
+sudo visudo -cf /etc/sudoers.d/cotacoes-openclaw      # validar (NÃO pular)
+sudo rm -f /etc/sudoers.d/cotador-cotacoes            # remover regra antiga (só cotador), se existir
 ```
 
-### 4.3. Testar o disparo manual (como deploy)
+### 4.3. Testar os disparos (como deploy)
 
 ```bash
 sudo su deploy
-sudo /usr/local/bin/disparar-cotador          # não deve pedir senha
-tail -f /var/log/cotador-trigger.log          # acompanhar a execução do agente
+sudo /usr/local/bin/disparar-cotador        # não deve pedir senha
+sudo /usr/local/bin/disparar-notificacao    # não deve pedir senha
+tail -f /var/log/cotador-trigger.log /var/log/notificacao-trigger.log
 ```
 
-### 4.4. Instalar o cron do scheduler do Laravel (como deploy)
+### 4.4. Cron do scheduler do Laravel (como deploy)
 
-> **Importante:** este servidor **não tinha** o scheduler do Laravel rodando — toda a
-> automação periódica vinha do cron interno do OpenClaw. É preciso criar a entrada.
+> Uma única entrada cobre **todos** os commands agendados. Se já existe (do cotador), pular.
 
 ```bash
 sudo su deploy
 crontab -e
+# adicionar:
+* * * * * cd /var/www/mestres-cotacoes && /usr/bin/php artisan schedule:run >> /dev/null 2>&1
 ```
 
-Adicionar a linha:
-
-```cron
-* * * * * cd /var/www/mestres-cotacoes && php artisan schedule:run >> /dev/null 2>&1
-```
-
-### 4.5. Desativar o cron interno do OpenClaw
-
-O cron antigo (`cotador-check`) precisa ser desativado para não duplicar o processamento:
+### 4.5. Desativar os crons internos do OpenClaw
 
 ```bash
-# Listar e confirmar o ID:
-ssh mestremario "docker exec mestresdoseguro-assistant openclaw cron list"
+ssh mestremario "docker exec mestresdoseguro-assistant openclaw cron list"   # confirmar IDs
 
-# Desativar (NÃO remover — facilita rollback):
+# cotador-check:
 ssh mestremario "docker exec mestresdoseguro-assistant openclaw cron disable a6cc879c-cbf4-4fa1-89dd-4a5a2f0a7952"
+# notificacao-pendente-check:
+ssh mestremario "docker exec mestresdoseguro-assistant openclaw cron disable 8723f4c3-a013-4f13-a81b-10f859a2f78e"
 ```
 
-> O cron `notificacao-pendente-check` (a cada 5 min, agente `orquestrador`) é leve e **não é
-> alterado** por esta integração.
+> Observação: `openclaw cron list` só mostra jobs **enabled**. Para ver todos (incl. disabled),
+> consulte `/root/.openclaw/cron/jobs.json` dentro do container.
 
 ---
 
 ## 5. Validação
 
 ```bash
-# 1. O command roda sem erro mesmo sem pendências (deve ser silencioso):
-cd /var/www/mestres-cotacoes && php artisan cotacoes:disparar-cotador
+# Commands rodam sem erro mesmo sem trabalho (silencioso):
+cd /var/www/mestres-cotacoes
+php artisan cotacoes:disparar-cotador
+php artisan cotacoes:disparar-notificacao
 
-# 2. Com uma sub-solicitação pendente, confirmar que dispara:
-#    - criar/registrar uma cotação de teste
-#    - rodar o command e ver "Cotador disparado..." + a entrada em /var/log/cotador-trigger.log
+# Cron do sistema executando o scheduler:
+grep 'schedule:run' /var/log/syslog | tail -3
 
-# 3. Confirmar que o agente marcou a sub como running/completed:
-#    via dashboard ou: SELECT status FROM cotacao_sub_solicitacoes ORDER BY created_at DESC LIMIT 5;
-
-# 4. Acompanhar consumo: não deve mais haver execuções do cotador em vazio.
+# Com trabalho pendente, confirmar disparo nos logs:
+tail /var/log/cotador-trigger.log /var/log/notificacao-trigger.log
 ```
 
 ---
@@ -183,9 +182,9 @@ cd /var/www/mestres-cotacoes && php artisan cotacoes:disparar-cotador
 
 | Cenário | Ação |
 |---------|------|
-| Pausar o disparo temporariamente | `OPENCLAW_COTADOR_DISPATCH_ENABLED=false` no `.env` + `php artisan config:clear` |
-| Voltar ao modelo antigo (cron OpenClaw) | Reabilitar: `docker exec mestresdoseguro-assistant openclaw cron enable a6cc879c-...` e remover a linha do crontab do scheduler |
-| Remover a permissão | `sudo rm /etc/sudoers.d/cotador-cotacoes` |
+| Pausar um disparo | `OPENCLAW_COTADOR_DISPATCH_ENABLED=false` (ou `_NOTIFICACAO_`) no `.env` + `php artisan config:clear` |
+| Voltar ao cron antigo do OpenClaw | `docker exec mestresdoseguro-assistant openclaw cron enable <id>` e remover a linha do crontab |
+| Remover a permissão | `sudo rm /etc/sudoers.d/cotacoes-openclaw` |
 
 ---
 
@@ -193,8 +192,9 @@ cd /var/www/mestres-cotacoes && php artisan cotacoes:disparar-cotador
 
 | Sintoma | Causa provável | Verificação |
 |---------|----------------|-------------|
-| Cotações ficam `pending` e nada acontece | scheduler do Laravel não está rodando | `crontab -l` (usuário deploy); `php artisan schedule:list` |
-| `sudo: a senha é necessária` no log | sudoers não instalado/incorreto | `sudo visudo -cf /etc/sudoers.d/cotador-cotacoes` |
-| Disparo ocorre mas nada cota | container parado ou agente com erro | `docker ps`; `tail /var/log/cotador-trigger.log`; `docker logs mestresdoseguro-assistant` |
-| Cotador dispara em duplicidade | lock/`running` não está sendo setado | conferir se o agente chama o PATCH `status=running`; revisar `LOCK_SECONDS` no command |
-| Esgotamento de créditos volta | cron antigo do OpenClaw reativado | `docker exec ... openclaw cron list` → `cotador-check` deve estar `disabled` |
+| Cotações ficam `pending` e nada acontece | scheduler do Laravel não está rodando | `crontab -l` (deploy); `php artisan schedule:list` |
+| Corretor não recebe a devolutiva | disparo de notificação desabilitado / agente com erro | `tail /var/log/notificacao-trigger.log`; conferir `broker_notified_at` no banco |
+| `sudo: a senha é necessária` no log | sudoers não instalado/incorreto | `sudo visudo -cf /etc/sudoers.d/cotacoes-openclaw` |
+| Disparo ocorre mas nada acontece | container parado ou agente com erro | `docker ps`; logs do trigger; `docker logs mestresdoseguro-assistant` |
+| Notificação duplicada ao corretor | turn do orquestrador > lock e `broker_notified_at` não setado | revisar `LOCK_SECONDS`/`CARENCIA_MINUTOS`; conferir se o agente marca `broker_notified_at` |
+| Esgotamento de créditos volta | cron antigo do OpenClaw reativado | `docker exec ... openclaw cron list` → não deve listar `cotador-check`/`notificacao-pendente-check` |
